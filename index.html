@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hand Sign Controller — Buddy</title>
+<style>
+  :root{
+    --bg:#faf6ef; --ink:#241f1a; --muted:#7a7168; --card:#fffdf9;
+    --line:#e7ded1; --accent:#c65d2e; --ok:#3f7d54; --r:10px;
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --bg:#1b1815; --ink:#f0e9df; --muted:#9c9084; --card:#241f1b;
+      --line:#3a332c; --accent:#e07a4a; --ok:#6fbf88;
+    }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+    padding:16px;max-width:900px;margin-inline:auto}
+  h1{font-size:1.4rem;margin:.2rem 0}
+  p.sub{color:var(--muted);margin:.2rem 0 1rem}
+  .grid{display:grid;gap:16px;grid-template-columns:1fr;align-items:start}
+  @media(min-width:720px){.grid{grid-template-columns:1.3fr 1fr}}
+  .card{background:var(--card);border:1px solid var(--line);
+    border-radius:var(--r);padding:14px}
+  .stage{position:relative;background:#000;border-radius:var(--r);overflow:hidden;aspect-ratio:4/3}
+  video,canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+  canvas{pointer-events:none}
+  .row{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+  button{font:inherit;padding:.5rem .8rem;border:1px solid var(--line);
+    background:var(--bg);color:var(--ink);border-radius:8px;cursor:pointer}
+  button:hover{border-color:var(--accent)}
+  .sign{font-size:2.4rem;line-height:1}
+  .big{font-size:2.2rem;font-variant-numeric:tabular-nums;font-weight:600}
+  .lbl{color:var(--muted);font-size:.8rem;text-transform:uppercase;letter-spacing:.05em}
+  .said{min-height:2.6em}
+  kbd{background:var(--bg);border:1px solid var(--line);border-bottom-width:2px;
+    border-radius:5px;padding:1px 6px;font:inherit;font-size:.85em}
+  .map{width:100%;border-collapse:collapse;margin-top:6px}
+  .map td{padding:5px 4px;border-bottom:1px solid var(--line);vertical-align:middle}
+  code{background:var(--bg);padding:1px 5px;border-radius:5px;border:1px solid var(--line)}
+  .muted{color:var(--muted)}
+</style>
+</head>
+<body>
+  <h1>Hand Sign Controller</h1>
+  <p class="sub">Your Buddy: sees a hand sign → understands it → talks + does something. No account, runs on your laptop.</p>
+
+  <div class="grid">
+    <div class="card">
+      <div class="stage">
+        <video id="video" autoplay muted playsinline></video>
+        <canvas id="overlay"></canvas>
+      </div>
+      <div class="row">
+        <button id="camBtn">Start camera</button>
+        <span id="status" class="muted" style="align-self:center">press Start camera, or use keys 1-4 to test</span>
+      </div>
+      <p class="muted" style="margin:.6rem 0 0">
+        No camera handy? Press <kbd>1</kbd><kbd>2</kbd><kbd>3</kbd><kbd>4</kbd> to fake the four
+        signs and test everything below.
+      </p>
+    </div>
+
+    <div class="card">
+      <div class="lbl">Sees</div>
+      <div class="sign" id="seesEmoji">—</div>
+      <div class="lbl" style="margin-top:.6rem">Says</div>
+      <div class="said big" id="says" style="font-size:1.15rem">…</div>
+      <div class="lbl" style="margin-top:.6rem">Focus timer</div>
+      <div class="big" id="timer">25:00</div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:16px">
+    <div class="lbl">Your control map</div>
+    <table class="map">
+      <tr><td class="sign">✋</td><td><code>palm</code></td><td><kbd>1</kbd></td><td>Start 25-min focus timer <span class="muted">(in the page)</span></td></tr>
+      <tr><td class="sign">✊</td><td><code>fist</code></td><td><kbd>2</kbd></td><td>Open YouTube Music</td></tr>
+      <tr><td class="sign">✌️</td><td><code>peace</code></td><td><kbd>3</kbd></td><td>Previous browser tab</td></tr>
+      <tr><td class="sign">👍</td><td><code>thumb</code></td><td><kbd>4</kbd></td><td>Minimize everything <span class="muted">(Win+D)</span></td></tr>
+    </table>
+    <p class="muted" style="margin:.6rem 0 0">Desktop actions (fist/peace/thumb) need the helper running: <code>py -3 buddy_keys.py</code></p>
+  </div>
+
+<script>
+/* ============================================================
+   HAND SIGN CONTROLLER
+
+   Vision: Google MediaPipe, in the browser, free, no account, no keys.
+   It gives 21 dots per hand; classifyHand() turns those dots into one
+   of our four signs by checking which fingers are up.
+
+     A) classifyHand  — dots -> a sign        <-- the brains
+     B) dispatch      — a sign -> do a thing
+     C) plumbing      — debounce, speech, timer, keyboard, camera
+   ============================================================ */
+
+const EMOJI = {palm:"✋", fist:"✊", peace:"✌️", thumb:"👍"};
+const CONFIDENCE = 0.6;   // ignore weak detections
+
+/* ---- A) classifyHand ------------------------------------------
+   lm = 21 landmarks, each {x,y} normalised 0..1 (y grows downward).
+   A finger is "up" when its tip is higher on screen than its middle
+   knuckle. MediaPipe's landmark numbers are fixed and documented.   */
+function fingerUp(lm, tip, pip){ return lm[tip].y < lm[pip].y; }
+function classifyHand(lm){
+  const index  = fingerUp(lm, 8, 6);
+  const middle = fingerUp(lm, 12, 10);
+  const ring   = fingerUp(lm, 16, 14);
+  const pinky  = fingerUp(lm, 20, 18);
+  const upCount = [index, middle, ring, pinky].filter(Boolean).length;
+
+  if(index && middle && ring && pinky) return "palm";
+  if(index && middle && !ring && !pinky) return "peace";
+  if(upCount === 0){
+    // fingers all curled: thumb sticking up = thumbs-up, else a fist.
+    const thumbUp = lm[4].y < lm[2].y - 0.05;   // ponytail: simple y check, tune margin if needed
+    return thumbUp ? "thumb" : "fist";
+  }
+  return null;   // in-between shape: say nothing
+}
+window.classifyHand = classifyHand;
+
+/* ---- B) dispatch: a sign -> an action -------------------------- */
+function dispatch(sign){
+  if(sign === "palm"){          // stays in the browser: a focus timer
+    startTimer(25);
+    say("Focus time. Let's go.");
+    return;
+  }
+  // fist / peace / thumb are REAL desktop actions done by buddy_keys.py.
+  // change what a sign does by editing ACTIONS in buddy_keys.py.
+  sendCmd(sign);
+}
+
+const SPEAK = {
+  fist:  "Opening your music.",
+  peace: "Previous tab.",
+  thumb: "Minimizing everything.",
+};
+function sendCmd(sign){
+  say(SPEAK[sign] || sign);
+  fetch("http://127.0.0.1:5001/cmd/"+sign)
+    .catch(()=> say("Start the helper first: py -3 buddy_keys.py"));
+}
+
+/* ---- C) plumbing (leave alone) -------------------------------- */
+const $ = id => document.getElementById(id);
+const seesEmoji=$("seesEmoji"), saysEl=$("says"), timerEl=$("timer"), statusEl=$("status");
+function setStatus(t){ statusEl.textContent = t; }
+window.setStatus = setStatus;
+
+function say(text){
+  saysEl.textContent = text;
+  try{ speechSynthesis.cancel(); speechSynthesis.speak(new SpeechSynthesisUtterance(text)); }
+  catch(e){}
+}
+
+let timerId=null, secondsLeft=25*60;
+function renderTimer(){
+  const m=String(Math.floor(secondsLeft/60)).padStart(2,"0");
+  const s=String(secondsLeft%60).padStart(2,"0");
+  timerEl.textContent = m+":"+s;
+}
+function startTimer(minutes){
+  clearInterval(timerId); secondsLeft=minutes*60; renderTimer();
+  timerId=setInterval(()=>{
+    if(secondsLeft>0){ secondsLeft--; renderTimer(); }
+    else { clearInterval(timerId); say("Time's up. Nice work."); }
+  },1000);
+}
+
+/* debounce: fire once per NEW sign, cooldown so a held hand doesn't spam */
+let activeSign=null, lastFireAt=0;
+const COOLDOWN_MS=1200;
+function handleSign(sign, confidence, now=Date.now()){
+  if(confidence < CONFIDENCE) return false;
+  if(sign===activeSign && now-lastFireAt < COOLDOWN_MS) return false;
+  activeSign=sign; lastFireAt=now;
+  seesEmoji.textContent = EMOJI[sign] || "?";
+  dispatch(sign);
+  return true;
+}
+window.handleSign = handleSign;
+
+/* keyboard test mode */
+const KEYS={"1":"palm","2":"fist","3":"peace","4":"thumb"};
+addEventListener("keydown",e=>{ if(KEYS[e.key]) handleSign(KEYS[e.key], 0.99); });
+
+/* self-test: the classifier tells the four signs apart. No camera needed. */
+function fakeHand(spec){
+  const lm=Array.from({length:21},()=>({x:0.5,y:0.5}));
+  const set=(tip,pip,up)=>{ lm[pip].y=0.60; lm[tip].y = up?0.40:0.72; };
+  set(8,6,spec.idx); set(12,10,spec.mid); set(16,14,spec.rng); set(20,18,spec.pky);
+  lm[2].y=0.60; lm[4].y = spec.thb ? 0.40 : 0.66;   // thumb tip above/below its knuckle
+  return lm;
+}
+function selfTest(){
+  console.assert(classifyHand(fakeHand({idx:1,mid:1,rng:1,pky:1,thb:1}))==="palm",  "open hand");
+  console.assert(classifyHand(fakeHand({idx:1,mid:1,rng:0,pky:0,thb:0}))==="peace", "peace sign");
+  console.assert(classifyHand(fakeHand({idx:0,mid:0,rng:0,pky:0,thb:0}))==="fist",  "closed fist");
+  console.assert(classifyHand(fakeHand({idx:0,mid:0,rng:0,pky:0,thb:1}))==="thumb", "thumbs up");
+  console.assert(classifyHand(fakeHand({idx:1,mid:0,rng:0,pky:0,thb:0}))===null,    "one finger = no command");
+  console.log("[selftest] 5 checks pass");
+}
+renderTimer(); selfTest();
+</script>
+
+<script type="module">
+/* camera + MediaPipe hand tracking. Loads from a CDN, first run downloads a
+   small model (~a few MB) once, then runs on your laptop, offline and free. */
+import { HandLandmarker, FilesetResolver }
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision/vision_bundle.mjs";
+
+const video = document.getElementById("video");
+let landmarker = null;
+
+async function initDetector(){
+  window.setStatus("loading hand model… (one-time download)");
+  const vision = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision/wasm");
+  landmarker = await HandLandmarker.createFromOptions(vision, {
+    baseOptions: { modelAssetPath:
+      "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task" },
+    runningMode: "VIDEO", numHands: 1,
+  });
+}
+
+async function start(){
+  try{
+    const stream = await navigator.mediaDevices.getUserMedia({video:true});
+    video.srcObject = stream; await video.play();
+  }catch(e){ window.setStatus("camera blocked: "+e.message); return; }
+  if(!landmarker) await initDetector();
+  window.setStatus("watching your hand");
+  loop();
+}
+
+function loop(){
+  if(landmarker && video.readyState >= 2){
+    const res = landmarker.detectForVideo(video, performance.now());
+    if(res.landmarks && res.landmarks[0]){
+      const sign = window.classifyHand(res.landmarks[0]);
+      if(sign) window.handleSign(sign, 0.99);
+    }
+  }
+  requestAnimationFrame(loop);
+}
+
+document.getElementById("camBtn").onclick = start;
+</script>
+</body>
+</html>
